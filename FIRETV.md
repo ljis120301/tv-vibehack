@@ -55,6 +55,45 @@ What is left: after Home, the launcher snapshot is not interactive for about fiv
  Amazon's launcher stays in RAM (77–130 MB PSS measured), because
 Fire OS will not let it be killed.
 
+## Fire OS 8
+
+Tested on a Fire TV Stick 4K Max (AFTKRT), Fire OS 8.1.8.5 (Android 11, API 30). The Fire OS 6 build did not work:
+
+- **Crash on start.** `startForeground()` threw `SecurityException: ... requires android.permission.FOREGROUND_SERVICE`
+  (needed since Android 9). `HomeWatchService` died in `onCreate`, taking `MainActivity` with it, which is the
+  spinner-then-gone the first attempt saw. Fixed by declaring `FOREGROUND_SERVICE`; the notification now also has a
+  channel (Android 8+ rejects foreground notifications without one), and the service is started with
+  `startForegroundService()` on API 26+ so the boot receiver's start is not refused as a background start.
+- **Home never seen.** `READ_LOGS` granted over adb still works on Android 11: the app's logcat sees the system and
+  events buffers. But Android 10+ logs activity starts as `ActivityTaskManager` (not `ActivityManager`) and the event
+  tags are `wm_resume_activity` / `wm_pause_activity` (not `am_*`). The watcher now follows both sets. A Home press
+  shows `from uid 0` here, so leaving Amazon's Settings row accepts uid 0 as well as 1000.
+- Nothing else needed: `TYPE_APPLICATION_OVERLAY` with the `SYSTEM_ALERT_WINDOW` app-op works, and no
+  `foregroundServiceType` is required at targetSdk 29. Amazon's launcher stays protected (not touched).
+
+| Case (Fire OS 8) | Result |
+|---|---|
+| Install + grants + `am start` | Launcher draws, `HomeWatchService` foreground, no crash |
+| `input keyevent HOME` on the launcher | Cover up 26 ms, bounce 66 ms; launcher focused at 7 s |
+| Home inside Netflix | Cover up 38 ms, bounce 103 ms; launcher focused |
+| Open a tile (Alexa Smart Home), then Back | Back returns to the launcher |
+| Reboot | Amazon home shows briefly, then the launcher comes up on its own (~40 s after `adb reboot`); Home works after |
+
+**Home delay and double presses (Fire OS 8).** Android 11 still holds back the launcher's start for five seconds after
+Home (`Activity start request from <uid> stopped`), and no permission an adb-sideloaded app can get lifts that hold, so
+the snapshot cover stays. Presses made on it are queued and replayed (`replaying N keys from the cover`). A second Home
+inside the hold drops the held-back start and restarts the hold; the watcher used to dedupe that second START and the
+stick was left on Amazon's home. Now every Home START asks again and pushes the cover's timeout out. The cover also has
+a hard 7 s timeout and is removed as soon as any other app resumes.
+
+| Case (Fire OS 8, second round) | Result |
+|---|---|
+| Home, then Right+Left on the cover, ×3 | Launcher at ~5 s each time, 2 keys replayed |
+| Home twice 1 s apart, ×3; Home ×3 back-to-back | Launcher in front each time (failed before this fix) |
+| Home inside an app, then Right on the cover | Launcher in front, no cover window left over |
+
+Not tested on Fire OS 8: Settings menu / "All settings" row, hardware remote key, screensaver.
+
 ## Install
 
 ```bash

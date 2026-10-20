@@ -2,6 +2,8 @@ package com.gathin.tvhome;
 
 import android.Manifest;
 import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.Service;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
@@ -54,10 +56,11 @@ public class HomeWatchService extends Service {
     /** Set by BootReceiver: cover the screen at once, there is no launcher to bounce to yet. */
     private static final String EXTRA_COVER = "cover";
     /** Longer than Android's five-second app-switch hold, in case the launcher never comes up. */
-    private static final long COVER_TIMEOUT_MS = 8000L;
+    private static final long COVER_TIMEOUT_MS = 7000L;
     /** A Home press logs a start and then a resume of Amazon's home; act on the first only. */
     private static final long DEDUPE_MS = 2000L;
     private static final int MAX_KEYS = 12;
+    private static final String CHANNEL = "homewatch";
 
     /** Latest frame of the launcher, kept fresh by MainActivity. Same process, so a static. */
     static Bitmap snapshot;
@@ -88,14 +91,27 @@ public class HomeWatchService extends Service {
 
     static void start(Context ctx, boolean cover) {
         if (ctx.checkSelfPermission(Manifest.permission.READ_LOGS) != PackageManager.PERMISSION_GRANTED) return;
-        ctx.startService(new Intent(ctx, HomeWatchService.class).putExtra(EXTRA_COVER, cover));
+        Intent i = new Intent(ctx, HomeWatchService.class).putExtra(EXTRA_COVER, cover);
+        // Android 8+: a plain startService() from the background (boot receiver, restart) is refused.
+        if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i);
+        else ctx.startService(i);
     }
 
     @Override
     public void onCreate() {
         super.onCreate();
+        Notification.Builder b;
+        if (Build.VERSION.SDK_INT >= 26) {
+            // Android 8+: a foreground notification without a valid channel crashes the app ("Bad notification").
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            nm.createNotificationChannel(new NotificationChannel(CHANNEL, getString(R.string.app_name),
+                    NotificationManager.IMPORTANCE_MIN));
+            b = new Notification.Builder(this, CHANNEL);
+        } else {
+            b = new Notification.Builder(this);
+        }
         @SuppressWarnings("deprecation")
-        Notification n = new Notification.Builder(this)
+        Notification n = b
                 .setSmallIcon(R.drawable.ic_settings)
                 .setContentTitle(getString(R.string.app_name))
                 .setPriority(Notification.PRIORITY_MIN)
@@ -130,6 +146,8 @@ public class HomeWatchService extends Service {
                 String since = new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
                 logcat = new ProcessBuilder("logcat", "-b", "system", "-b", "events", "-b", "main", "-v", "brief",
                         "-T", since, "ActivityManager:I", "am_resume_activity:I", "am_pause_activity:I",
+                        // Android 10+ (Fire OS 8): START is logged by ActivityTaskManager, events are wm_*.
+                        "ActivityTaskManager:I", "wm_resume_activity:I", "wm_pause_activity:I",
                         "SceneNodePresenter:I", "*:S")
                         .redirectErrorStream(true).start();
                 BufferedReader in = new BufferedReader(new InputStreamReader(logcat.getInputStream()));
@@ -140,25 +158,34 @@ public class HomeWatchService extends Service {
                         if (amazonHomeAllowed && !amazonPaused) {
                             amazonHomeAllowed = false;
                             final long seen = SystemClock.uptimeMillis();
-                            handler.postAtFrontOfQueue(() -> goHome(seen));
+                            handler.postAtFrontOfQueue(() -> goHome(seen, false));
                         }
                         continue;
                     }
-                    if (!line.contains(AMAZON_HOME)) continue;
-                    if (line.startsWith("I/am_pause_activity")) {
+                    if (!line.contains(AMAZON_HOME)) {
+                        // Some other app came to the front (the launcher could not): never leave the cover over it.
+                        if ((line.startsWith("I/wm_resume_activity") || line.startsWith("I/am_resume_activity"))
+                                && !line.contains(getPackageName())) {
+                            handler.post(this::removeCover);
+                        }
+                        continue;
+                    }
+                    if (line.startsWith("I/am_pause_activity") || line.startsWith("I/wm_pause_activity")) {
                         amazonPaused = true;
                         continue;
                     }
                     boolean started = line.contains("START u0") && line.contains("android.intent.category.HOME");
-                    boolean resumed = line.startsWith("I/am_resume_activity");
+                    boolean resumed = line.startsWith("I/am_resume_activity") || line.startsWith("I/wm_resume_activity");
                     if (resumed) amazonPaused = false;
                     if (amazonHomeAllowed) {
-                        if (!started || !line.contains("from uid 1000 ")) continue;
+                        // The Home key's START comes from uid 1000 on Fire OS 6, uid 0 on Fire OS 8.
+                        if (!started || !line.matches(".*from uid (0|1000)( .*)?$")) continue;
                         amazonHomeAllowed = false;   // Home pressed: back to this launcher
                     }
                     if (started || resumed) {
                         final long seen = SystemClock.uptimeMillis();
-                        handler.postAtFrontOfQueue(() -> goHome(seen));
+                        final boolean homeKey = started;
+                        handler.postAtFrontOfQueue(() -> goHome(seen, homeKey));
                     }
                 }
             } catch (IOException e) {
@@ -184,12 +211,18 @@ public class HomeWatchService extends Service {
         HomeWatchService s = running;
         if (s != null && s.cover != null) s.handler.postDelayed(s.dropCover, 150);   // let its first frame land
         List<Integer> keys = new ArrayList<>(pendingKeys);
+        if (!keys.isEmpty()) Log.i(TAG, "replaying " + keys.size() + " keys from the cover");
         pendingKeys.clear();
         return keys;
     }
 
     private void showCover() {
-        if (cover != null || (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this))) return;
+        if (cover != null) {
+            handler.removeCallbacks(dropCover);   // hold restarted: keep the hard timeout ahead of it
+            handler.postDelayed(dropCover, COVER_TIMEOUT_MS);
+            return;
+        }
+        if ((Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this))) return;
         pendingKeys.clear();
         // The cover's root view gets every key sent to its window, focused child or not. Keys meant for Amazon's
         // home underneath: keep the navigation ones for the launcher, drop the rest.
@@ -247,8 +280,10 @@ public class HomeWatchService extends Service {
         cover = null;
     }
 
-    private void goHome(long seen) {
-        if (seen - lastBounce < DEDUPE_MS) return;
+    private void goHome(long seen, boolean homeKey) {
+        // A second Home press drops the start still held back from the first one and restarts Android's
+        // five-second hold, so every Home START must ask again; only the resume that follows a start is a duplicate.
+        if (!homeKey && seen - lastBounce < DEDUPE_MS) return;
         lastBounce = seen;
         showCover();
         Log.i(TAG, "cover up after " + (SystemClock.uptimeMillis() - seen) + " ms");
