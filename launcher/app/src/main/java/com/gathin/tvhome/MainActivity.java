@@ -27,6 +27,7 @@ import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.view.animation.AnimationUtils;
 import android.view.animation.LayoutAnimationController;
 import android.widget.FrameLayout;
@@ -158,9 +159,26 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             int h = b - t;
             int dockRow = (int) ((145 + 6 + 12) * density);   // item height plus DockDecoration offsets
             int want = Math.max(0, h - dockRow - (int) (30 * density));
-            if (grid.getPaddingTop() != want) {
+            // Fewer than four columns: keep four-column cell widths and centre the row, so a two-app dock sits
+            // mid-screen instead of at the edges. Four or more columns: no side padding, as before.
+            int side = COLUMNS < 4 ? (r - l) * (4 - COLUMNS) / 8 : 0;
+            if (grid.getPaddingTop() == want && grid.getPaddingLeft() == side) return;
+            if (side == 0) {
                 grid.setPadding(grid.getPaddingLeft(), want, grid.getPaddingRight(), grid.getPaddingBottom());
+                return;
             }
+            // Side padding set inside this layout pass was not picked up by the layout manager (tiles stayed at the
+            // edges), so set it on the next frame and put the glass and top shelf back on the focused tile after.
+            grid.post(() -> {
+                grid.setPadding(side, want, side, grid.getPaddingBottom());
+                grid.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
+                    @Override
+                    public void onGlobalLayout() {
+                        grid.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                        focusTile(lastFocused);
+                    }
+                });
+            });
         });
 
         // Keep the glass glued to its tile while the grid scrolls.

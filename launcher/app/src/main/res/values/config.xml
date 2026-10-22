@@ -23,6 +23,7 @@
     <!-- The TV's Live TV / tuner app, offered at the end of the Inputs menu. Empty on a streaming stick. -->
     <string name="live_tv_package" translatable="false"></string>
 
-    <!-- Tiles per row in the grid; the dock always has this many slots. -->
+    <!-- Tiles per row in the grid; the dock always has this many slots. Below 4 the row keeps four-column tile
+         spacing and is centred, e.g. 2 for a stick with two apps. -->
     <integer name="columns">4</integer>
 </resources>
